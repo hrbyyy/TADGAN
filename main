@@ -295,143 +295,7 @@ def train(Generator, lambda_m,lambda_b,Discriminator_x,Discriminator_z,opt,d_cli
 
 
 
-def inference(device,testloader,lambda_m,lambda_b,lp,opt,outp,filename):
-  
-    pred_loss_dx = 0
-    pred_loss_dz=0
-    pred_loss_g=0
 
-    n_samples = len(testloader.dataset)
-    labels = torch.empty(size=(n_samples, lp), device=device)
-    reconstruct_probs = torch.empty(size=(n_samples, lp), device=device)
-    errlist = torch.empty(size=(n_samples, lp,output_dim), device=device)
-
-    reconstruct_seqs = torch.empty(size=(n_samples, lp,output_dim), device=device)
-    real_seqs = torch.empty(size=(n_samples, lp,output_dim), device=device)
-
-
-    with torch.no_grad():
-        generator=Generator(opt)
-        generator=nn.DataParallel(generator)
-        generator.to(device)
-        generator.eval()
-
-        discriminator_x=Discriminator_x(opt)
-        discriminator_x=nn.DataParallel(discriminator_x)
-        discriminator_x.to(device)
-        discriminator_x.eval()
-
-        discriminator_z = Discriminator_z(opt)
-        discriminator_z = nn.DataParallel(discriminator_z)
-        discriminator_z.to(device)
-        discriminator_z.eval()
-
-        criterion_g = torch.nn.MSELoss(reduction='sum')
-        criterion2 = torch.nn.MSELoss(reduction='none') 
-      
-        state = torch.load(outp+'model.pth')
-        generator.load_state_dict(state['generator'])
-        discriminator_x.load_state_dict(state['discriminator_x'])
-        discriminator_z.load_state_dict(state['discriminator_z'])
-       
-        torch.cuda.synchronize()
-        t0=time.process_time()
-        for batch_idx, data in enumerate(testloader):
-            start_idx = batch_idx * batchsize
-            end_idx = min(n_samples, int((batch_idx + 1) * batchsize))
-
-            label = data[1][:,  :,-1]
-
-            inputs, targets = data[0][:, : , :- 1], data[1][:, :, :-1]
-            b, t,f = inputs.shape
-            z = torch.randn(size=(b, t,opt.dim_z )).to(device)
-            inputs, targets = inputs.to(device), targets.to(device)
-
-            real_label_x = torch.linspace(0.9, 1, targets.shape[0] * targets.shape[1], device=device).reshape(
-                targets.shape[0], targets.shape[1])
-
-            predict_label_x = torch.zeros(size=(targets.shape[0], targets.shape[1]), device=device)
-
-            real_label_z = torch.linspace(0.9, 1, z.shape[0] * z.shape[1], device=device).reshape(z.shape[0],
-                                                                                                  z.shape[1])
-
-            predict_label_z = torch.zeros(size=(z.shape[0], z.shape[1]), device=device)
-
-            torch.cuda.synchronize()
-            tstart = time.process_time()
-
-          
-            real_out_dx = discriminator_x(targets)  
-            dx_loss_real = score_GAN.binary_CE(real_out_dx, real_label_x, reduction='sum') 
-            fake_out_dx = discriminator_x(generator.module.decoder(z))
-            dx_loss_fake = score_GAN.binary_CE(fake_out_dx, predict_label_x, reduction='sum')
-            dx_loss = dx_loss_real + dx_loss_fake
-           
-            real_out_dz = discriminator_z(z) 
-            dz_loss_real = score_GAN.binary_CE(real_out_dz, real_label_z, reduction='sum')
-            fake_out_dz = discriminator_z(generator.module.encoder(inputs))
-            dz_loss_fake = score_GAN.binary_CE(fake_out_dz, predict_label_z, reduction='sum')
-            dz_loss = dz_loss_real + dz_loss_fake
-          
-            outputs_g, latent_g = generator(inputs)  
-            fake_dx_out = discriminator_x(outputs_g)
-            G_dx_loss = score_GAN.binary_CE(fake_dx_out, real_label_x, reduction='sum')
-            fake_dz_out = discriminator_z(latent_g)
-            G_dz_loss = score_GAN.binary_CE(fake_dz_out, real_label_z, reduction='sum')
-            G_d_loss = G_dx_loss + G_dz_loss
-            G_rec_loss = criterion_g(outputs_g, targets)
-
-            loss_g = lambda_m * G_rec_loss + lambda_b * G_d_loss
-
-
-            torch.cuda.synchronize()
-            tend = time.process_time()
-            per_time = (tend - tstart) / len(inputs)
-
-            err=criterion2(outputs_g,targets)
-
-          
-
-            pred_loss_dx +=  dx_loss.item()
-            pred_loss_dz += dz_loss.item()
-
-            pred_loss_g+=loss_g.item()
-            real_seqs[start_idx:end_idx, :, :] = targets
-            reconstruct_seqs[start_idx:end_idx, :, :] = outputs_g
-            errlist[start_idx:end_idx, :, :] = err
-
-            labels[start_idx:end_idx, :] = label
-            reconstruct_probs[start_idx:end_idx, :] = fake_dx_out
-
-        torch.cuda.synchronize()
-        t1 = time.process_time()
-        cpu_time = t1 - t0   
-        reconstruct_seqs = reconstruct_seqs.detach().cpu().numpy()
-        real_seqs = real_seqs.detach().cpu().numpy()
-        errlist = errlist.detach().cpu().numpy()
-
-        labels = labels.detach().cpu().numpy()
-        reconstruct_probs = reconstruct_probs.detach().cpu().numpy()
-        test_stats = {
-            'G_loss':pred_loss_g,
-            'Dx_loss':pred_loss_dx,
-            'Dz_loss': pred_loss_dz,
-            "error_vectors":errlist,  
-            "true_labels": labels,
-
-            'predict_seqs': reconstruct_seqs,
-            'real_seqs': real_seqs,
-            'predict_probs':reconstruct_probs
-        }
-        pickle.dump(test_stats, open(outp + filename + '_errslabels.pkl', 'wb'))
-        df = pd.DataFrame(columns=['prediction D loss', 'prediction feature loss','cpu_time', 'per inference time'])
-        df = df.append({'prediction Dx loss': pred_loss_dx, 'prediction Dz loss': pred_loss_dz,'cpu_time': cpu_time, 'per inference time': per_time},
-                       ignore_index=True)
-        df.to_csv(outp + filename + '_losstime.csv')
-        torch.cuda.empty_cache()
-        del testloader
-        gc.collect()
-    return
 
 
 
@@ -465,82 +329,43 @@ if __name__ == "__main__":
     threshold = 2 
 
    
-    p0 = ''
-    if os.path.exists(p0) == False:
-        os.mkdir(p0, 0o777)
-
-
-    p0=p0+'window'+str(window)+'/'
-    if os.path.exists(p0) == False:
-        os.mkdir(p0, 0o777)
-    
-    opt = Options( c_in=77, c_out=77,dim_z=dim_z)
-
-
-    for r in range(repeats):
-        outp = p0 + str(r) + '/'
-        if os.path.exists(outp) == False:
-            os.mkdir(outp, 0o777)
-
-
-        generator = Generator(opt)
-        generator = nn.DataParallel(generator)
-        generator.to(device)
-        discriminatorx = Discriminator_x(opt)
-        discriminatorx = nn.DataParallel(discriminatorx)
-        discriminatorx.to(device)
-        discriminatorz = Discriminator_z(opt)
-        discriminatorz = nn.DataParallel(discriminatorz)
-        discriminatorz.to(device)
-        optimizer_g = optim.RMSprop(generator.parameters(), lr=5 * 1e-4)
-        optimizer_dz = optim.RMSprop(discriminatorz.parameters(), lr=1* 1e-4)
-        optimizer_dx = optim.RMSprop(discriminatorx.parameters(), lr=1 * 1e-4)
    
-      
-        total_running = epoches  
-        epoch_train_times = []
-        for epoch in range(epoches): 
-            trainloader, val1loader,  testloader = form_dataloader(batchsize, datapath)
-           
-            del testloader
-            gc.collect()
-            torch.cuda.synchronize()
-            start = time.process_time()
-            losst_g, losst_dx,losst_dz = train(generator, lambda_m, lambda_b, discriminatorx,discriminatorz,opt, d_clip, device,
-                                     trainloader,  epoch, losst_g, losst_dx,losst_dz, optimizer_g,
-                                     optimizer_dx,optimizer_dz)  
-            del trainloader
-            gc.collect()
-            torch.cuda.synchronize()
-            end = time.process_time()
-            epoch_train_time = end - start
-            epoch_train_times.append(epoch_train_time)
-          
-           
-            torch.cuda.empty_cache()
-      
-        state = {
-            'generator': generator.state_dict(),
-            'discriminator_x': discriminatorx.state_dict(),
-            'discriminator_z': discriminatorz.state_dict(),
-        }
 
-     
-        torch.save(state, outp + 'model.pth')
+    generator = Generator(opt)
+    generator = nn.DataParallel(generator)
+    generator.to(device)
+    discriminatorx = Discriminator_x(opt)
+    discriminatorx = nn.DataParallel(discriminatorx)
+    discriminatorx.to(device)
+    discriminatorz = Discriminator_z(opt)
+    discriminatorz = nn.DataParallel(discriminatorz)
+    discriminatorz.to(device)
+    optimizer_g = optim.RMSprop(generator.parameters(), lr=5 * 1e-4)
+    optimizer_dz = optim.RMSprop(discriminatorz.parameters(), lr=1* 1e-4)
+    optimizer_dx = optim.RMSprop(discriminatorx.parameters(), lr=1 * 1e-4)
 
 
-      
-      
+    total_running = epoches  
+    epoch_train_times = []
+    for epoch in range(epoches): 
+        trainloader, val1loader,  testloader = form_dataloader(batchsize, datapath)
 
-        trainloader, val1loader, testloader = form_dataloader(batchsize, datapath)
-        del trainloader
-        del val1loader
-     
-        inference(device, testloader, lambda_m, lambda_b, window, opt, outp, 'test') 
         del testloader
-       
-        torch.cuda.empty_cache()
         gc.collect()
+
+        losst_g, losst_dx,losst_dz = train(generator, lambda_m, lambda_b, discriminatorx,discriminatorz,opt, d_clip, device,
+                                 trainloader,  epoch, losst_g, losst_dx,losst_dz, optimizer_g,
+                                 optimizer_dx,optimizer_dz)  
+
+
+
+
+      
+      
+
+     
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 
